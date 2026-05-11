@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.log
+
+.venv/
+venv/
+
+*.tmp
+*.bak
+*.lnk
+
+docs/media/raw/
