@@ -1,5 +1,9 @@
 # AI Usage Tray
 
+<p align="center">
+  <img src="assets/logo.png" alt="AI Usage Tray logo" width="180">
+</p>
+
 Windows tray icons for local Claude Code and Codex CLI usage.
 
 The app runs four notification-area icons:
