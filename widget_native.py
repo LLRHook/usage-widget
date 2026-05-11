@@ -25,6 +25,9 @@ import customtkinter as ctk
 
 HERE      = Path(__file__).resolve().parent
 WIDGET_PY = HERE / "widget.py"
+ICON_ICO  = HERE / "assets" / "AIUsage.ico"
+ICON_PNG  = HERE / "assets" / "logo-256.png"
+APP_ID    = "VictorIvanov.AIUsageTray.Dashboard"
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 REFRESH_SECONDS = 60
 
@@ -41,6 +44,16 @@ MUTED_2   = "#6a6e7a"
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+
+def set_windows_app_id() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except Exception:
+        pass
 
 
 def find_python(name: str) -> Path:
@@ -301,7 +314,9 @@ class Dashboard(ctk.CTk):
 
         # Try to load icon
         try:
-            self.iconbitmap(str(HERE / "assets" / "AIUsage.ico"))
+            self.iconbitmap(default=str(ICON_ICO))
+            self._icon_photo = tk.PhotoImage(file=str(ICON_PNG))
+            self.iconphoto(True, self._icon_photo)
         except Exception:
             pass
 
@@ -586,6 +601,7 @@ class Dashboard(ctk.CTk):
 
 
 def main():
+    set_windows_app_id()
     app = Dashboard()
     app.mainloop()
 
