@@ -15,12 +15,15 @@ Each icon shows percentage left. Clicking any icon opens the native stats dashbo
 
 ![Dashboard](docs/media/dashboard.png)
 
+![Tray demo](docs/media/tray-demo.gif)
+
 ## Install
 
 Use Python 3.11+ on Windows.
 
 ```powershell
-cd "C:\Users\Victor\Documents\personal projects\usage-widget"
+git clone https://github.com/LLRHook/usage-widget.git
+cd usage-widget
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe .\tray.py --install-startup

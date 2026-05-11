@@ -11,10 +11,15 @@ Each one shows percent left. Click any icon to open a compact stats dashboard wi
 Install:
 
 ```powershell
+git clone https://github.com/LLRHook/usage-widget.git
+cd usage-widget
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe .\tray.py --install-startup
 ```
+
+GitHub:
+https://github.com/LLRHook/usage-widget
 
 Uninstall:
 
