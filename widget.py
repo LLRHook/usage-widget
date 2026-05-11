@@ -27,6 +27,28 @@ CLAUDE_PRICES = {
     "haiku":  {"in":  0.80, "cache_w":  1.00, "cache_r": 0.08, "out":  4.00},
 }
 
+# OpenAI per-million-token list prices (USD). These are API-value display
+# estimates, not billing-grade numbers for a ChatGPT/Codex subscription.
+CODEX_PRICES = {
+    "gpt-5.5":            {"in": 5.00, "cached": 0.500, "out": 30.00},
+    "gpt-5.4-mini":      {"in": 0.75, "cached": 0.075, "out":  4.50},
+    "gpt-5.4":           {"in": 2.50, "cached": 0.250, "out": 15.00},
+    "gpt-5.2-codex":     {"in": 1.75, "cached": 0.175, "out": 14.00},
+    "gpt-5.2":           {"in": 1.75, "cached": 0.175, "out": 14.00},
+    "gpt-5.1-codex-max": {"in": 1.25, "cached": 0.125, "out": 10.00},
+    "gpt-5.1-codex":     {"in": 1.25, "cached": 0.125, "out": 10.00},
+    "gpt-5.1":           {"in": 1.25, "cached": 0.125, "out": 10.00},
+    "gpt-5-codex":       {"in": 1.25, "cached": 0.125, "out": 10.00},
+    "gpt-5-mini":        {"in": 0.25, "cached": 0.025, "out":  2.00},
+    "gpt-5-nano":        {"in": 0.05, "cached": 0.005, "out":  0.40},
+    "gpt-5":             {"in": 1.25, "cached": 0.125, "out": 10.00},
+    "gpt-4.1-mini":      {"in": 0.40, "cached": 0.100, "out":  1.60},
+    "gpt-4.1-nano":      {"in": 0.10, "cached": 0.025, "out":  0.40},
+    "gpt-4.1":           {"in": 2.00, "cached": 0.500, "out":  8.00},
+    "gpt-4o-mini":       {"in": 0.15, "cached": 0.075, "out":  0.60},
+    "gpt-4o":            {"in": 2.50, "cached": 1.250, "out": 10.00},
+}
+
 
 def family(model: str) -> str:
     m = (model or "").lower()
@@ -239,6 +261,28 @@ def codex_usage_delta(current: dict, previous: dict | None) -> dict:
     }
 
 
+def codex_price_for_model(model: str | None) -> tuple[str, dict | None]:
+    name = (model or "").lower()
+    for key in sorted(CODEX_PRICES, key=len, reverse=True):
+        if name == key or name.startswith(key + "-"):
+            return key, CODEX_PRICES[key]
+    return name or "unknown", None
+
+
+def codex_estimated_cost(usage: dict, price: dict | None) -> float:
+    if not price:
+        return 0.0
+    input_tokens = max(as_int(usage.get("input")), 0)
+    cached_tokens = min(max(as_int(usage.get("cached")), 0), input_tokens)
+    uncached_input = input_tokens - cached_tokens
+    output_tokens = max(as_int(usage.get("output")), 0)
+    return (
+        uncached_input * price["in"]
+        + cached_tokens * price["cached"]
+        + output_tokens * price["out"]
+    ) / 1_000_000
+
+
 def merge_codex_rate_limits(candidates: list[tuple[datetime, dict]]) -> tuple[dict | None, datetime | None]:
     if not candidates:
         return None, None
@@ -284,10 +328,15 @@ def scan_codex() -> dict:
     """
     by_day: dict[str, dict] = defaultdict(lambda: {
         "input": 0, "output": 0, "reasoning": 0, "cached": 0, "tokens": 0,
-        "sessions": 0,
+        "cost": 0.0, "sessions": 0,
+    })
+    by_model: dict[str, dict] = defaultdict(lambda: {
+        "input": 0, "output": 0, "reasoning": 0, "cached": 0, "tokens": 0,
+        "cost": 0.0, "messages": 0,
     })
     totals = {"input": 0, "output": 0, "reasoning": 0, "cached": 0,
-              "tokens": 0, "sessions": 0, "plan": None, "model": None}
+              "tokens": 0, "cost": 0.0, "sessions": 0, "plan": None,
+              "model": None, "pricing_model": None}
     rate_candidates: list[tuple[datetime, dict]] = []
 
     if not CODEX_SESSIONS.exists():
@@ -309,18 +358,30 @@ def scan_codex() -> dict:
                 current_usage = codex_usage_totals(info.get("total_token_usage") or {})
                 delta = codex_usage_delta(current_usage, previous_usage)
                 previous_usage = current_usage
+                price_model, price = codex_price_for_model(session_model)
+                cost = codex_estimated_cost(delta, price)
 
                 day = ts.astimezone().strftime("%Y-%m-%d")
                 b = by_day[day]
                 for key in ("input", "output", "reasoning", "cached", "tokens"):
                     b[key] += delta[key]
                     totals[key] += delta[key]
+                b["cost"] += cost
+                totals["cost"] += cost
+                if price:
+                    totals["pricing_model"] = price_model
                 if day not in session_days:
                     b["sessions"] += 1
                     session_days.add(day)
                 if not session_has_usage:
                     totals["sessions"] += 1
                     session_has_usage = True
+
+                mb = by_model[price_model]
+                for key in ("input", "output", "reasoning", "cached", "tokens"):
+                    mb[key] += delta[key]
+                mb["cost"] += cost
+                mb["messages"] += 1
 
                 rl = payload.get("rate_limits")
                 if rl:
@@ -336,6 +397,7 @@ def scan_codex() -> dict:
 
     return {
         "by_day": dict(by_day),
+        "by_model": {k: dict(v) for k, v in by_model.items()},
         "totals": totals,
         "rate_limits": latest_rate,
         "rate_limits_at": latest_rate_at.isoformat() if latest_rate_at else None,
@@ -413,6 +475,11 @@ def build_view(claude: dict, codex: dict) -> dict:
     )
     week_codex_tokens = sum(
         b.get("tokens", b.get("input", 0) + b.get("output", 0))
+        for d, b in codex["by_day"].items()
+        if datetime.fromisoformat(d).date() >= week_cut
+    )
+    week_codex_cost = sum(
+        float(b.get("cost", 0))
         for d, b in codex["by_day"].items()
         if datetime.fromisoformat(d).date() >= week_cut
     )
@@ -495,13 +562,17 @@ def build_view(claude: dict, codex: dict) -> dict:
                 "output": float(x_today.get("output", 0)),
                 "reasoning": float(x_today.get("reasoning", 0)),
                 "cached": float(x_today.get("cached", 0)),
+                "cost": float(x_today.get("cost", 0)),
                 "sessions": int(x_today.get("sessions", 0) or 0),
             },
             "totals": codex["totals"],
+            "by_model": codex.get("by_model", {}),
             "rate_limits": codex.get("rate_limits"),
             "rate_limits_at": codex.get("rate_limits_at"),
             "week_tokens": week_codex_tokens,
+            "week_cost": week_codex_cost,
             "series_tokens": series(codex["by_day"], "tokens"),
+            "series_cost": series(codex["by_day"], "cost"),
         },
     }
 
@@ -526,6 +597,7 @@ def main() -> int:
         print(f"  Claude today: {fmt_num(view['claude']['today']['tokens'])} tokens · "
               f"{fmt_money(view['claude']['today']['cost'])}")
         print(f"  Codex today:  {fmt_num(view['codex']['today']['tokens'])} tokens · "
+              f"{fmt_money(view['codex']['today']['cost'])} · "
               f"{view['codex']['today']['sessions']} sessions")
     else:
         print(json.dumps(view, indent=2, default=str))

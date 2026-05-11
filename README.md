@@ -60,6 +60,6 @@ Get-AppxPackage -Name AIUsageWidget | Remove-AppxPackage
 - Claude data is read from `%USERPROFILE%\.claude\projects`.
 - Codex data is read from `%USERPROFILE%\.codex\sessions`.
 - Claude plan percentages come from `probe_claude.py`, which uses Claude Code's local OAuth credentials and caches rate-limit headers in `%TEMP%\claude_ratelimits.json`.
-- Codex percentages come from the latest local Codex `token_count` rate-limit payloads.
+- Codex percentages and API-value estimates come from local Codex `token_count` payloads. Cost estimates use OpenAI list prices for the detected model and treat cached input at the cached-input rate when available.
 
-No telemetry is sent by this app except the optional Claude rate-limit probe to Anthropic when `probe_claude.py` refreshes its cache.
+No telemetry is sent by this app except the optional Claude rate-limit probe to Anthropic when `probe_claude.py` refreshes its cache. Cost figures are local estimates for comparison, not billing statements.

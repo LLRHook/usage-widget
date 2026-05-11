@@ -336,15 +336,16 @@ class Dashboard(ctk.CTk):
         self._g_x5h = Gauge(gauges, "Codex · 5h",  ACCENT_CODEX);  self._g_x5h.grid(row=0, column=2, padx=4, sticky="nsew")
         self._g_x7d = Gauge(gauges, "Codex · 7d",  ACCENT_CODEX);  self._g_x7d.grid(row=0, column=3, padx=4, sticky="nsew")
 
-        # Snapshot row (4 stat cards)
+        # Snapshot row
         snap = ctk.CTkFrame(body, fg_color="transparent")
         snap.pack(fill="x", padx=8, pady=(0, 14))
-        for i in range(4):
+        for i in range(5):
             snap.grid_columnconfigure(i, weight=1, uniform="s")
         self._tok    = StatCard(snap, "Claude tokens today"); self._tok.grid(row=0, column=0, padx=4, sticky="nsew")
-        self._cost   = StatCard(snap, "Est. API value today"); self._cost.grid(row=0, column=1, padx=4, sticky="nsew")
-        self._cache  = StatCard(snap, "Cache hit ratio"); self._cache.grid(row=0, column=2, padx=4, sticky="nsew")
-        self._burn   = StatCard(snap, "Burn rate (last 60 min)"); self._burn.grid(row=0, column=3, padx=4, sticky="nsew")
+        self._cost   = StatCard(snap, "Claude API value today"); self._cost.grid(row=0, column=1, padx=4, sticky="nsew")
+        self._codex_cost = StatCard(snap, "Codex API value today"); self._codex_cost.grid(row=0, column=2, padx=4, sticky="nsew")
+        self._cache  = StatCard(snap, "Cache hit ratio"); self._cache.grid(row=0, column=3, padx=4, sticky="nsew")
+        self._burn   = StatCard(snap, "Burn rate (last 60 min)"); self._burn.grid(row=0, column=4, padx=4, sticky="nsew")
 
         # Model donut + Activity heatmap
         row3 = ctk.CTkFrame(body, fg_color="transparent")
@@ -433,6 +434,12 @@ class Dashboard(ctk.CTk):
                       f"{int(today.get('messages', 0) or 0):,} messages")
         self._cost.set(fmt_money(today.get("cost", 0)),
                        f"7d: {fmt_money(c.get('week_cost', 0))}")
+        codex_today = codex.get("today", {}) or {}
+        pricing_model = (codex.get("totals", {}) or {}).get("pricing_model")
+        pricing_detail = f"7d: {fmt_money(codex.get('week_cost', 0))}"
+        if pricing_model:
+            pricing_detail = f"{pricing_detail} · {pricing_model}"
+        self._codex_cost.set(fmt_money(codex_today.get("cost", 0)), pricing_detail)
 
         total_input = (totals.get("input", 0) + totals.get("cache_w", 0) + totals.get("cache_r", 0))
         ratio = (totals.get("cache_r", 0) / total_input * 100) if total_input else 0
