@@ -354,7 +354,7 @@ class Dashboard(ctk.CTk):
         row3.grid_columnconfigure(1, weight=2, uniform="r3")
         model_card = ctk.CTkFrame(row3, fg_color=BG_PANEL, corner_radius=14)
         model_card.grid(row=0, column=0, padx=(0,6), sticky="nsew")
-        ctk.CTkLabel(model_card, text="Model split (all-time)", font=("Segoe UI Semibold", 12),
+        ctk.CTkLabel(model_card, text="Claude model value (all-time)", font=("Segoe UI Semibold", 12),
                      text_color=TEXT).pack(anchor="w", padx=14, pady=(12, 6))
         mc_body = ctk.CTkFrame(model_card, fg_color="transparent")
         mc_body.pack(fill="both", expand=True, padx=14, pady=(0, 14))
@@ -368,6 +368,9 @@ class Dashboard(ctk.CTk):
                      font=("Segoe UI Semibold", 12), text_color=TEXT).pack(anchor="w", padx=14, pady=(12, 0))
         self._heat = Heatmap(heat_card)
         self._heat.pack(fill="both", expand=True, padx=14, pady=(4, 14))
+
+        self._codex_models = BarList(body, "Codex models · by API value", ACCENT_CODEX)
+        self._codex_models.pack(fill="x", padx=8, pady=(0, 14))
 
         # Projects + Tools
         row4 = ctk.CTkFrame(body, fg_color="transparent")
@@ -386,6 +389,13 @@ class Dashboard(ctk.CTk):
                      text_color=TEXT).pack(anchor="w", padx=14, pady=(12, 6))
         self._table = ctk.CTkFrame(table_card, fg_color="transparent")
         self._table.pack(fill="x", padx=14, pady=(0, 14))
+
+        codex_table_card = ctk.CTkFrame(body, fg_color=BG_PANEL, corner_radius=14)
+        codex_table_card.pack(fill="x", padx=8, pady=(0, 14))
+        ctk.CTkLabel(codex_table_card, text="Last 7 days · Codex", font=("Segoe UI Semibold", 12),
+                     text_color=TEXT).pack(anchor="w", padx=14, pady=(12, 6))
+        self._codex_table = ctk.CTkFrame(codex_table_card, fg_color="transparent")
+        self._codex_table.pack(fill="x", padx=14, pady=(0, 14))
 
         self.after(100, self._refresh)
         self.after(REFRESH_SECONDS * 1000, self._tick)
@@ -477,6 +487,18 @@ class Dashboard(ctk.CTk):
             ctk.CTkLabel(row, text=f"{fmt_num(tok)} · {fmt_money(cost)}",
                          font=("Segoe UI", 10), text_color=MUTED, anchor="e").pack(side="right")
 
+        codex_models = []
+        for name, m in (codex.get("by_model", {}) or {}).items():
+            cost = float(m.get("cost", 0) or 0)
+            tokens = float(m.get("tokens", 0) or 0)
+            codex_models.append({
+                "name": f"{name} · {fmt_num(tokens)} tokens",
+                "weight": cost or tokens,
+                "label": fmt_money(cost),
+            })
+        codex_models.sort(key=lambda r: r["weight"], reverse=True)
+        self._codex_models.set_rows(codex_models)
+
         # Heatmap (deferred until canvas has a size)
         self.update_idletasks()
         self._heat.render(c.get("heatmap", []))
@@ -523,6 +545,36 @@ class Dashboard(ctk.CTk):
                 color = ACCENT_CLAUDE if is_today and i == 0 else (TEXT if i == 0 else MUTED)
                 ctk.CTkLabel(row, text=v, font=("Segoe UI", 11),
                              text_color=color, anchor=anchor, width=widths[i]).pack(side="left", padx=2)
+
+        for child in self._codex_table.winfo_children():
+            child.destroy()
+        codex_cols = ("Date", "Tokens", "Input", "Output", "Cached", "Reasoning", "Cost", "Sessions")
+        codex_widths = (110, 90, 90, 80, 100, 100, 80, 80)
+        codex_header = ctk.CTkFrame(self._codex_table, fg_color="transparent")
+        codex_header.pack(fill="x")
+        for i, name in enumerate(codex_cols):
+            anchor = "w" if i == 0 else "e"
+            ctk.CTkLabel(codex_header, text=name.upper(), font=("Segoe UI", 9),
+                         text_color=MUTED_2, anchor=anchor, width=codex_widths[i]).pack(side="left", padx=2)
+        for r in (codex.get("daily", []) or []):
+            row = ctk.CTkFrame(self._codex_table, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            is_today = r.get("date") == today_label
+            vals = (
+                r.get("date", ""),
+                fmt_num(r.get("tokens", 0)),
+                fmt_num(r.get("input", 0)),
+                fmt_num(r.get("output", 0)),
+                fmt_num(r.get("cached", 0)),
+                fmt_num(r.get("reasoning", 0)),
+                fmt_money(r.get("cost", 0)),
+                f"{r.get('sessions', 0):,}",
+            )
+            for i, v in enumerate(vals):
+                anchor = "w" if i == 0 else "e"
+                color = ACCENT_CODEX if is_today and i == 0 else (TEXT if i == 0 else MUTED)
+                ctk.CTkLabel(row, text=v, font=("Segoe UI", 11),
+                             text_color=color, anchor=anchor, width=codex_widths[i]).pack(side="left", padx=2)
 
 
 def main():

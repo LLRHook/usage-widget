@@ -508,8 +508,9 @@ def build_view(claude: dict, codex: dict) -> dict:
     days_7 = [(datetime.now().astimezone() - timedelta(days=i)).strftime("%Y-%m-%d")
               for i in range(6, -1, -1)]
 
-    # Per-day richer row for the table.
+    # Per-day richer rows for the dashboard tables.
     daily_table = []
+    codex_daily_table = []
     for d in days_7:
         b = claude["by_day"].get(d, {})
         daily_table.append({
@@ -521,6 +522,17 @@ def build_view(claude: dict, codex: dict) -> dict:
             "cache_r":  b.get("cache_r", 0),
             "cost":     b.get("cost", 0.0),
             "messages": b.get("messages", 0),
+        })
+        xb = codex["by_day"].get(d, {})
+        codex_daily_table.append({
+            "date":      d,
+            "tokens":    xb.get("tokens", xb.get("input", 0) + xb.get("output", 0)),
+            "input":     xb.get("input", 0),
+            "output":    xb.get("output", 0),
+            "cached":    xb.get("cached", 0),
+            "reasoning": xb.get("reasoning", 0),
+            "cost":      xb.get("cost", 0.0),
+            "sessions":  xb.get("sessions", 0),
         })
 
     return {
@@ -569,6 +581,7 @@ def build_view(claude: dict, codex: dict) -> dict:
             "by_model": codex.get("by_model", {}),
             "rate_limits": codex.get("rate_limits"),
             "rate_limits_at": codex.get("rate_limits_at"),
+            "daily": codex_daily_table,
             "week_tokens": week_codex_tokens,
             "week_cost": week_codex_cost,
             "series_tokens": series(codex["by_day"], "tokens"),

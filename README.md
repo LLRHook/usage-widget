@@ -13,7 +13,7 @@ The app runs four notification-area icons:
 - Codex 5-hour window
 - Codex weekly window
 
-Each icon shows percentage left. Clicking any icon opens the native stats dashboard with today's totals, model split, top projects/tools, activity heatmap, and recent daily totals.
+Each icon shows percentage left. Clicking any icon opens the native stats dashboard with today's totals, Claude and Codex API-value estimates, model split, top projects/tools, activity heatmap, and recent daily totals.
 
 ![Tray icons](docs/media/tray-icons.png)
 
