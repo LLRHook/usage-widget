@@ -29,6 +29,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 
+from widget import usage_percent
+
 HERE = Path(__file__).resolve().parent
 WIDGET_PY = HERE / "widget.py"
 PROBE_PY  = HERE / "probe_claude.py"
@@ -135,26 +137,33 @@ class Stats:
         self.snapshot: dict = {}
 
     def refresh(self) -> dict:
-        py = find_python("python.exe")
+        py = None
         data_error = None
         try:
+            py = find_python("python.exe")
             raw = subprocess.check_output(
                 [str(py), str(WIDGET_PY), "--json"],
                 stderr=subprocess.DEVNULL, encoding="utf-8", timeout=15,
                 creationflags=NO_WINDOW,
             )
             data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("collector returned a non-object JSON value")
         except Exception as e:
             data_error = str(e)
             data = None
 
         try:
+            if py is None:
+                raise FileNotFoundError("python.exe")
             raw = subprocess.check_output(
                 [str(py), str(PROBE_PY)],
                 stderr=subprocess.DEVNULL, encoding="utf-8", timeout=15,
                 creationflags=NO_WINDOW,
             )
             plan = json.loads(raw or "{}")
+            if not isinstance(plan, dict):
+                plan = {}
         except Exception:
             plan = {}
 
@@ -167,10 +176,7 @@ class Stats:
             data = {}
 
         def util(key: str) -> float | None:
-            try:
-                return float(plan[key]) * 100
-            except (KeyError, TypeError, ValueError):
-                return None
+            return usage_percent(plan.get(key), 100)
 
         claude_5h_used = util("anthropic-ratelimit-unified-5h-utilization")
         claude_7d_used = util("anthropic-ratelimit-unified-7d-utilization")
@@ -178,12 +184,9 @@ class Stats:
         def left(u): return None if u is None else max(0.0, 100 - u)
 
         def codex_snapshot(bucket):
-            if not bucket:
+            if not isinstance(bucket, dict) or not bucket:
                 return {"used": None, "left": None, "tokens": None, "fallback": False}
-            try:
-                used = float(bucket.get("used_percent", 0) or 0)
-            except (TypeError, ValueError):
-                used = None
+            used = usage_percent(bucket.get("used_percent"))
             return {"used": used, "left": left(used), "tokens": None, "fallback": False}
 
         # Fallback for Claude: when the plan probe isn't available, surface
@@ -208,6 +211,8 @@ class Stats:
                 "codex_7d":  codex_snapshot(rl.get("secondary") or {}),
                 "generated_at": data.get("generated_at", time.strftime("%a %b %d · %I:%M %p")),
             }
+            if data_error:
+                self.snapshot["error"] = data_error
             return self.snapshot
 
     def get(self) -> dict:
@@ -231,16 +236,16 @@ def open_dashboard(_icon=None, _item=None) -> None:
         if _dashboard_proc and _dashboard_proc.poll() is None:
             return
 
-    py = find_python("pythonw.exe")
-    native = HERE / "widget_native.py"
-    _dashboard_proc = subprocess.Popen(
-        [str(py), str(native)],
-        creationflags=NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 0),
-    )
+        py = find_python("pythonw.exe")
+        native = HERE / "widget_native.py"
+        _dashboard_proc = subprocess.Popen(
+            [str(py), str(native)],
+            creationflags=NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 0),
+        )
 
 
 def build_icon(slug: str, label: str, accent: tuple, stats: Stats,
-               force_refresh) -> pystray.Icon:
+               force_refresh, quit_all) -> pystray.Icon:
     snap = stats.get().get(slug, {})
     value = fmt_pct(snap.get("left"))
     util  = snap.get("used")
@@ -255,7 +260,7 @@ def build_icon(slug: str, label: str, accent: tuple, stats: Stats,
     menu = pystray.Menu(
         pystray.MenuItem("Open dashboard", click, default=True),
         pystray.MenuItem("Refresh now",    refresh_clicked),
-        pystray.MenuItem("Quit",           lambda i, _: i.stop_all() if hasattr(i, 'stop_all') else i.stop()),
+        pystray.MenuItem("Quit",           lambda i, _: quit_all()),
     )
     title = f"{label}: {value} left"
     return pystray.Icon(name=f"ai-usage-{slug}",
@@ -270,19 +275,14 @@ def main_loop() -> int:
     icons: list[pystray.Icon] = []
     threads: list[threading.Thread] = []
     refresh_event = threading.Event()
+    stop_event = threading.Event()
 
     def force_refresh():
         refresh_event.set()
 
-    for slug, label, accent in ICONS:
-        ico = build_icon(slug, label, accent, stats, force_refresh)
-        icons.append(ico)
-        t = threading.Thread(target=ico.run, daemon=True, name=f"tray-{slug}")
-        t.start()
-        threads.append(t)
-
-    # Wait briefly for icons to appear in the tray before our first update push.
-    time.sleep(0.5)
+    def quit_all():
+        stop_event.set()
+        refresh_event.set()
 
     def fmt_tok(n):
         n = float(n or 0)
@@ -309,22 +309,37 @@ def main_loop() -> int:
             except Exception:
                 pass
 
-    update_all()
-
     # Refresh once a minute. The "force_refresh" event lets the right-click
     # menu's "Refresh now" cut in early.
     try:
-        while True:
-            if refresh_event.wait(timeout=POLL_SECONDS):
-                refresh_event.clear()
-            stats.refresh()
+        for slug, label, accent in ICONS:
+            ico = build_icon(slug, label, accent, stats, force_refresh, quit_all)
+            icons.append(ico)
+            t = threading.Thread(target=ico.run, daemon=True, name=f"tray-{slug}")
+            t.start()
+            threads.append(t)
+
+        # Allow icons to appear, while still responding immediately to Quit.
+        stop_event.wait(timeout=0.5)
+        if not stop_event.is_set():
             update_all()
+
+        while not stop_event.is_set():
+            refresh_event.wait(timeout=POLL_SECONDS)
+            refresh_event.clear()
+            if stop_event.is_set():
+                break
+            stats.refresh()
+            if not stop_event.is_set():
+                update_all()
     except KeyboardInterrupt:
         pass
     finally:
         for ico in icons:
             try: ico.stop()
             except Exception: pass
+        for thread in threads:
+            thread.join(timeout=1)
 
     return 0
 

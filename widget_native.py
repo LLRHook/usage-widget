@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
 import time
@@ -22,6 +23,8 @@ from pathlib import Path
 from datetime import datetime
 
 import customtkinter as ctk
+
+from widget import usage_percent
 
 HERE      = Path(__file__).resolve().parent
 WIDGET_PY = HERE / "widget.py"
@@ -101,14 +104,17 @@ def fmt_resets_in(unix_sec) -> str:
 
 def query() -> dict:
     """Run widget.py --json and parse the result."""
-    py = find_python("python.exe")
     try:
+        py = find_python("python.exe")
         raw = subprocess.check_output(
             [str(py), str(WIDGET_PY), "--json"],
             stderr=subprocess.DEVNULL, encoding="utf-8", timeout=30,
             creationflags=NO_WINDOW,
         )
-        return json.loads(raw)
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("collector returned a non-object JSON value")
+        return data
     except Exception as e:
         return {"_error": str(e)}
 
@@ -152,6 +158,7 @@ class Gauge(ctk.CTkFrame):
         self._reset.pack(fill="x", pady=(4, 0))
 
     def set_value(self, used_pct: float | None, reset_unix=None):
+        used_pct = usage_percent(used_pct)
         if used_pct is None:
             self._pct.configure(text="—")
             self._used.configure(text="—")
@@ -418,21 +425,58 @@ class Dashboard(ctk.CTk):
         self._codex_table = ctk.CTkFrame(codex_table_card, fg_color="transparent")
         self._codex_table.pack(fill="x", padx=14, pady=(0, 14))
 
-        self.after(100, self._refresh)
-        self.after(REFRESH_SECONDS * 1000, self._tick)
+        self._closed = False
+        self._refreshing = False
+        self._refresh_results: queue.SimpleQueue = queue.SimpleQueue()
+        self._initial_after = self.after(100, self._refresh)
+        self._tick_after = self.after(REFRESH_SECONDS * 1000, self._tick)
+        self._drain_after = self.after(50, self._drain_refresh_results)
+        self.protocol("WM_DELETE_WINDOW", self._close)
 
     def _user_refresh(self):
-        self._gen.configure(text="refreshing...")
-        threading.Thread(target=self._refresh, daemon=True).start()
+        self._refresh()
 
     def _tick(self):
-        threading.Thread(target=self._refresh, daemon=True).start()
-        self.after(REFRESH_SECONDS * 1000, self._tick)
+        if self._closed:
+            return
+        self._refresh()
+        self._tick_after = self.after(REFRESH_SECONDS * 1000, self._tick)
 
     def _refresh(self):
-        data = query()
-        # Bounce back to Tk thread
-        self.after(0, lambda: self._render(data))
+        if self._closed or self._refreshing:
+            return
+        self._refreshing = True
+        self._gen.configure(text="refreshing...")
+
+        def collect():
+            # Workers never call Tk, including after(), which is unsafe once
+            # the window has closed. The Tk poller owns rendering and timers.
+            self._refresh_results.put(query())
+
+        threading.Thread(target=collect, daemon=True).start()
+
+    def _drain_refresh_results(self):
+        if self._closed:
+            return
+        try:
+            data = self._refresh_results.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self._refreshing = False
+            try:
+                self._render(data)
+            finally:
+                if not self._closed:
+                    self._drain_after = self.after(50, self._drain_refresh_results)
+            return
+        self._drain_after = self.after(50, self._drain_refresh_results)
+
+    def _close(self):
+        self._closed = True
+        for callback in (self._initial_after, self._tick_after, self._drain_after):
+            self.after_cancel(callback)
+        self.destroy()
 
     def _render(self, d: dict):
         if not d or d.get("_error"):
@@ -445,16 +489,13 @@ class Dashboard(ctk.CTk):
         rl    = codex.get("rate_limits") or {}
 
         def util(key):
-            v = plan.get(key)
-            if v is None: return None
-            try: return float(v) * 100
-            except (TypeError, ValueError): return None
+            return usage_percent(plan.get(key), 100)
 
         self._g_c5h.set_value(util("5h-utilization"), plan.get("5h-reset"))
         self._g_c7d.set_value(util("7d-utilization"), plan.get("7d-reset"))
-        self._g_x5h.set_value(float((rl.get("primary")   or {}).get("used_percent", 0) or 0),
+        self._g_x5h.set_value(usage_percent((rl.get("primary") or {}).get("used_percent")),
                               (rl.get("primary")   or {}).get("resets_at"))
-        self._g_x7d.set_value(float((rl.get("secondary") or {}).get("used_percent", 0) or 0),
+        self._g_x7d.set_value(usage_percent((rl.get("secondary") or {}).get("used_percent")),
                               (rl.get("secondary") or {}).get("resets_at"))
 
         c = d.get("claude", {}) or {}
