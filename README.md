@@ -64,7 +64,7 @@ Get-AppxPackage -Name AIUsageWidget | Remove-AppxPackage
 
 No telemetry is sent by this app except the optional Claude rate-limit probe to Anthropic when `probe_claude.py` refreshes its cache. Cost figures are local estimates for comparison, not billing statements.
 
-The Claude probe keeps the last available measurements during network or credential failures and waits at least five minutes before retrying. It also honors a longer `Retry-After` from the server, including when a forced refresh is requested. A rate-limited response can still update the displayed utilization when it includes usage headers. Cache writes are atomic so the tray and dashboard can read them concurrently.
+The Claude probe keeps the last available measurements during network or credential failures and waits at least five minutes before retrying. It also honors a longer `Retry-After` from the server, including when a forced refresh is requested. A rate-limited response can still update the displayed utilization when it includes usage headers. Cache writes are atomic so the tray and dashboard can read them concurrently. A shared file lock coordinates updates across processes, so an older failed request cannot replace a newer measurement or impose a stale cooldown on it.
 
 For a cache-only check that never reads credentials or sends a request:
 

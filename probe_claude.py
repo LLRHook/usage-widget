@@ -22,6 +22,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -142,6 +143,62 @@ def _write_cache(data: dict) -> None:
                 pass
 
 
+@contextmanager
+def _cache_lock():
+    """Lock a stable sidecar; replacing the JSON must not replace the lock."""
+    with CACHE.with_name(CACHE.name + ".lock").open("a+b") as stream:
+        if sys.platform == "win32":
+            import msvcrt
+            # locking() can lock beyond EOF, so the sidecar may stay empty.
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def _update_cache(data: dict, cached: dict | None = None) -> dict:
+    """Serialize success writes and failure read/merge/write transactions."""
+    def merge(latest):
+        if cached is None:
+            # A generation also distinguishes forced successes at equal times.
+            result = dict(data)
+            result["_measurement_generation"] = int(_number(latest.get("_measurement_generation"))) + 1
+            return result
+        if latest and (
+            latest.get("_measurement_generation") != cached.get("_measurement_generation")
+            or _number(latest.get("_fetched_at_unix")) > _number(cached.get("_fetched_at_unix"))
+        ):
+            # Another probe saved a measurement after this request's snapshot.
+            # Its success also supersedes this older request's failure cooldown.
+            return latest
+        result = dict(latest or cached)
+        result.update(data)
+        result["_retry_at_unix"] = max(
+            _number(latest.get("_retry_at_unix")), _number(data.get("_retry_at_unix"))
+        )
+        return result
+
+    try:
+        with _cache_lock():
+            result = merge(_read_cache())
+            _write_cache(result)
+            return result
+    except OSError:
+        # An unwritable/unavailable cache must not break offline fallback or
+        # trigger an uncoordinated write after failing to acquire the lock.
+        return merge(_read_cache())
+
+
 def _number(value) -> float:
     try:
         result = float(value)
@@ -162,12 +219,11 @@ def _retry_at(headers: dict, now: float) -> float:
 
 
 def _failed_probe(cached: dict, reason: str, now: float, headers: dict | None = None) -> dict:
-    result = dict(cached)
-    result["_stale_error" if cached else "_error"] = reason
-    result["_stale_at_unix"] = now
-    result["_retry_at_unix"] = _retry_at(headers or {}, now)
-    _write_cache(result)
-    return result
+    return _update_cache({
+        "_stale_error" if cached else "_error": reason,
+        "_stale_at_unix": now,
+        "_retry_at_unix": _retry_at(headers or {}, now),
+    }, cached)
 
 
 def probe(force: bool = False) -> dict:
@@ -232,8 +288,7 @@ def probe(force: bool = False) -> dict:
         return _failed_probe(cached, f"probe http {http_status}", time.time(), headers)
     if http_status == 429:
         parsed["_retry_at_unix"] = _retry_at(headers, time.time())
-    _write_cache(parsed)
-    return parsed
+    return _update_cache(parsed)
 
 
 def main() -> int:
