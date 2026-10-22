@@ -82,3 +82,7 @@ python -m py_compile widget.py widget_native.py tray.py probe_claude.py
 ```
 
 The tests use temporary JSONL/cache fixtures and mock HTTP, subprocess, and GUI backends. They do not read local usage records or credentials, open desktop windows, or make network requests. No additional test dependencies are required.
+
+GitHub Actions runs these same commands on Python 3.11 and 3.13 for pull requests
+and pushes to any branch. The workflow uses a read-only repository token and does
+not install the desktop dependencies or require account credentials.
