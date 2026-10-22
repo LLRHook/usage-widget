@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -51,7 +52,7 @@ CODEX_PRICES = {
 
 
 def family(model: str) -> str:
-    m = (model or "").lower()
+    m = model.lower() if isinstance(model, str) else ""
     if "opus" in m:
         return "opus"
     if "sonnet" in m:
@@ -62,10 +63,13 @@ def family(model: str) -> str:
 
 
 def parse_ts(s: str) -> datetime | None:
-    if not s:
+    if not isinstance(s, str) or not s:
         return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        # Preserve the local interpretation of unqualified timestamps, but
+        # make them comparable with the offset-aware timestamps in other files.
+        return parsed if parsed.tzinfo is not None else parsed.astimezone()
     except ValueError:
         return None
 
@@ -78,7 +82,9 @@ def iter_jsonl(path: Path) -> Iterable[dict]:
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    record = json.loads(line)
+                    if isinstance(record, dict):
+                        yield record
                 except json.JSONDecodeError:
                     continue
     except OSError:
@@ -123,17 +129,23 @@ def scan_claude() -> dict:
 
         for rec in iter_jsonl(jsonl):
             msg = rec.get("message") or {}
+            if not isinstance(msg, dict):
+                continue
 
             # Tool-use frequency (rough)
-            for block in (msg.get("content") or []):
+            content = msg.get("content")
+            for block in content if isinstance(content, list) else []:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     name = block.get("name") or "?"
-                    tool_use[name] += 1
+                    if isinstance(name, str):
+                        tool_use[name] += 1
 
             usage = msg.get("usage")
-            if not usage:
+            if not isinstance(usage, dict) or not usage:
                 continue
             msg_id = msg.get("id")
+            if not isinstance(msg_id, str):
+                msg_id = None
             if msg_id and msg_id in seen_msg_ids:
                 continue
             if msg_id:
@@ -145,10 +157,10 @@ def scan_claude() -> dict:
             local = ts.astimezone()
             day = local.strftime("%Y-%m-%d")
 
-            inp = int(usage.get("input_tokens") or 0)
-            out = int(usage.get("output_tokens") or 0)
-            cw  = int(usage.get("cache_creation_input_tokens") or 0)
-            cr  = int(usage.get("cache_read_input_tokens") or 0)
+            inp = as_int(usage.get("input_tokens"))
+            out = as_int(usage.get("output_tokens"))
+            cw  = as_int(usage.get("cache_creation_input_tokens"))
+            cr  = as_int(usage.get("cache_read_input_tokens"))
             tok = inp + out + cw + cr
 
             fam = family(msg.get("model", ""))
@@ -189,7 +201,7 @@ def scan_claude() -> dict:
             totals["cost"]    += cost
             totals["messages"] += 1
             sid = rec.get("sessionId")
-            if sid:
+            if isinstance(sid, str) and sid:
                 totals["sessions"].add(sid)
 
     by_day_out = {
@@ -230,8 +242,19 @@ def _finalise_totals(t: dict) -> dict:
 def as_int(v) -> int:
     try:
         return int(v or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def usage_percent(value, scale: float = 1.0) -> float | None:
+    """Return a finite percentage, keeping absent or invalid usage unknown."""
+    try:
+        percent = float(value) * scale
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(percent):
+        return None
+    return min(100.0, max(0.0, percent))
 
 
 def codex_usage_totals(total_usage: dict) -> dict:
@@ -262,7 +285,7 @@ def codex_usage_delta(current: dict, previous: dict | None) -> dict:
 
 
 def codex_price_for_model(model: str | None) -> tuple[str, dict | None]:
-    name = (model or "").lower()
+    name = model.lower() if isinstance(model, str) else ""
     for key in sorted(CODEX_PRICES, key=len, reverse=True):
         if name == key or name.startswith(key + "-"):
             return key, CODEX_PRICES[key]
@@ -297,6 +320,7 @@ def merge_codex_rate_limits(candidates: list[tuple[datetime, dict]]) -> tuple[di
             if isinstance(rate.get(bucket), dict)
         ]
         if not bucket_candidates:
+            merged.pop(bucket, None)
             continue
 
         bucket_ts, _bucket_rate, latest_bucket = max(bucket_candidates, key=lambda item: item[0])
@@ -304,13 +328,12 @@ def merge_codex_rate_limits(candidates: list[tuple[datetime, dict]]) -> tuple[di
         same_window = [
             b for _ts, _rate, b in bucket_candidates
             if b.get("resets_at") == reset_at
-        ]
+        ] if reset_at is not None else [latest_bucket]
 
         out = dict(latest_bucket)
-        try:
-            out["used_percent"] = max(float(b.get("used_percent") or 0) for b in same_window)
-        except (TypeError, ValueError):
-            pass
+        percentages = [usage_percent(b.get("used_percent")) for b in same_window]
+        valid_percentages = [value for value in percentages if value is not None]
+        out["used_percent"] = max(valid_percentages) if valid_percentages else None
         merged[bucket] = out
 
         if bucket_ts > latest_ts:
@@ -350,12 +373,24 @@ def scan_codex() -> dict:
         for rec in iter_jsonl(jsonl):
             rtype = rec.get("type")
             payload = rec.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
             if rtype == "turn_context":
                 session_model = payload.get("model") or session_model
             if rtype == "event_msg" and payload.get("type") == "token_count":
                 ts = parse_ts(rec.get("timestamp")) or datetime.now(timezone.utc)
+                rl = payload.get("rate_limits")
+                if isinstance(rl, dict) and rl:
+                    rate_candidates.append((ts, rl))
+                    totals["plan"] = rl.get("plan_type") or totals["plan"]
+
                 info = payload.get("info") or {}
-                current_usage = codex_usage_totals(info.get("total_token_usage") or {})
+                total_usage = info.get("total_token_usage") if isinstance(info, dict) else None
+                # Rate-limit-only events have no usage counters. Treating them
+                # as zero resets the baseline and double counts the next event.
+                if not isinstance(total_usage, dict) or not total_usage:
+                    continue
+                current_usage = codex_usage_totals(total_usage)
                 delta = codex_usage_delta(current_usage, previous_usage)
                 previous_usage = current_usage
                 price_model, price = codex_price_for_model(session_model)
@@ -382,11 +417,6 @@ def scan_codex() -> dict:
                     mb[key] += delta[key]
                 mb["cost"] += cost
                 mb["messages"] += 1
-
-                rl = payload.get("rate_limits")
-                if rl:
-                    rate_candidates.append((ts, rl))
-                    totals["plan"] = rl.get("plan_type") or totals["plan"]
 
         if session_has_usage:
             totals["model"] = session_model or totals["model"]
@@ -432,21 +462,23 @@ def claude_window_tokens(hours: float) -> int:
     for jsonl in CLAUDE_PROJECTS.rglob("*.jsonl"):
         for rec in iter_jsonl(jsonl):
             msg = rec.get("message") or {}
+            if not isinstance(msg, dict):
+                continue
             usage = msg.get("usage")
-            if not usage:
+            if not isinstance(usage, dict) or not usage:
                 continue
             ts = parse_ts(rec.get("timestamp"))
             if not ts or ts.astimezone() < cut:
                 continue
             mid = msg.get("id")
-            if mid:
+            if isinstance(mid, str) and mid:
                 if mid in seen_ids:
                     continue
                 seen_ids.add(mid)
-            total += (int(usage.get("input_tokens") or 0)
-                      + int(usage.get("output_tokens") or 0)
-                      + int(usage.get("cache_creation_input_tokens") or 0)
-                      + int(usage.get("cache_read_input_tokens") or 0))
+            total += (as_int(usage.get("input_tokens"))
+                      + as_int(usage.get("output_tokens"))
+                      + as_int(usage.get("cache_creation_input_tokens"))
+                      + as_int(usage.get("cache_read_input_tokens")))
     return total
 
 
