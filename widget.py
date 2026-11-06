@@ -93,148 +93,83 @@ def iter_jsonl(path: Path) -> Iterable[dict]:
 
 # ---------- Claude ----------
 
-def scan_claude() -> dict:
-    """Walk ~/.claude/projects/**/*.jsonl, sum usage by day/model/project/hour."""
-    by_day: dict[str, dict] = defaultdict(lambda: {
-        "input": 0, "output": 0, "cache_w": 0, "cache_r": 0,
-        "cost": 0.0, "messages": 0, "by_model": defaultdict(int),
-    })
-    by_model: dict[str, dict] = defaultdict(lambda: {
-        "input": 0, "output": 0, "cache_w": 0, "cache_r": 0, "cost": 0.0, "messages": 0,
-    })
-    by_project: dict[str, dict] = defaultdict(lambda: {"tokens": 0, "cost": 0.0, "messages": 0})
-    # 7d x 24h heatmap — keys are (day_offset, hour) in local time, value = total tokens
-    heatmap: dict[tuple[int, int], int] = defaultdict(int)
-    tool_use: dict[str, int] = defaultdict(int)
+def _scan_claude_batch(root: Path | None = None, *, now: datetime | None = None,
+                       windows: tuple[float, ...] = (5, 24 * 7), summary: bool = True) -> tuple[dict, list[int]]:
+    """Normalize host-specific telemetry once, then reduce one in-process batch.
 
-    totals = {"input": 0, "output": 0, "cache_w": 0, "cache_r": 0,
-              "cost": 0.0, "messages": 0, "sessions": set()}
-    seen_msg_ids: set[str] = set()
+    Python owns JSON/coercion and local-time/DST behavior. Rust owns summary and
+    per-window dedup, token/cost buckets, stable top-N ranking, heatmap and burn.
+    """
+    from usage_core import aggregate_claude
 
-    burn_cut_min = datetime.now().astimezone() - timedelta(minutes=60)
-    burn_tokens = 0
-    burn_cost = 0.0
+    root = CLAUDE_PROJECTS if root is None else Path(root)
+    now_local = (now or datetime.now()).astimezone()
+    cutoffs = [now_local - timedelta(hours=hours) for hours in windows]
+    if not root.exists():
+        return {"by_day": {}, "totals": {
+            "input": 0, "output": 0, "cache_w": 0, "cache_r": 0,
+            "cost": 0.0, "messages": 0, "sessions": 0,
+        }, "found": False}, [0] * len(windows)
 
-    if not CLAUDE_PROJECTS.exists():
-        return {"by_day": {}, "totals": _finalise_totals(totals), "found": False}
+    burn_cut = now_local - timedelta(minutes=60)
+    records = []
 
-    now_local = datetime.now().astimezone()
-    today_date = now_local.date()
+    def opaque(value: str) -> str:
+        # JSON telemetry can contain lone surrogates; Rust strings cannot.
+        # IDs and display names are opaque UTF-8/surrogatepass hex on the wire.
+        return value.encode("utf-8", errors="surrogatepass").hex()
 
-    for jsonl in CLAUDE_PROJECTS.rglob("*.jsonl"):
-        # The project folder name encodes the cwd with dashes — undo for display.
+    for jsonl in root.rglob("*.jsonl"):
         project_name = jsonl.parent.name.replace("C--", "C:/").replace("-", "/")
-        # Trim to a friendly tail
         project_short = "/".join(project_name.split("/")[-2:]) if "/" in project_name else project_name
-
         for rec in iter_jsonl(jsonl):
             msg = rec.get("message") or {}
             if not isinstance(msg, dict):
                 continue
-
-            # Tool-use frequency (rough)
+            tools = []
             content = msg.get("content")
             for block in content if isinstance(content, list) else []:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     name = block.get("name") or "?"
                     if isinstance(name, str):
-                        tool_use[name] += 1
-
+                        tools.append(name)
             usage = msg.get("usage")
-            if not isinstance(usage, dict) or not usage:
-                continue
-            msg_id = msg.get("id")
-            if not isinstance(msg_id, str):
-                msg_id = None
-            if msg_id and msg_id in seen_msg_ids:
-                continue
-            if msg_id:
-                seen_msg_ids.add(msg_id)
-
-            ts = parse_ts(rec.get("timestamp"))
-            if not ts:
-                continue
-            local = ts.astimezone()
-            day = local.strftime("%Y-%m-%d")
-
-            inp = as_int(usage.get("input_tokens"))
-            out = as_int(usage.get("output_tokens"))
-            cw  = as_int(usage.get("cache_creation_input_tokens"))
-            cr  = as_int(usage.get("cache_read_input_tokens"))
-            tok = inp + out + cw + cr
-
-            fam = family(msg.get("model", ""))
-            p = CLAUDE_PRICES[fam]
-            cost = (inp * p["in"] + cw * p["cache_w"] +
-                    cr * p["cache_r"] + out * p["out"]) / 1_000_000
-
-            bucket = by_day[day]
-            bucket["input"]   += inp
-            bucket["output"]  += out
-            bucket["cache_w"] += cw
-            bucket["cache_r"] += cr
-            bucket["cost"]    += cost
-            bucket["messages"] += 1
-            bucket["by_model"][fam] += tok
-
-            mb = by_model[fam]
-            mb["input"] += inp; mb["output"] += out
-            mb["cache_w"] += cw; mb["cache_r"] += cr
-            mb["cost"] += cost; mb["messages"] += 1
-
-            pb = by_project[project_short]
-            pb["tokens"] += tok; pb["cost"] += cost; pb["messages"] += 1
-
-            # Heatmap: day_offset = days back from today (0=today, 6=oldest in 7d window)
-            day_offset = (today_date - local.date()).days
-            if 0 <= day_offset <= 6:
-                heatmap[(day_offset, local.hour)] += tok
-
-            if local >= burn_cut_min:
-                burn_tokens += tok
-                burn_cost += cost
-
-            totals["input"]   += inp
-            totals["output"]  += out
-            totals["cache_w"] += cw
-            totals["cache_r"] += cr
-            totals["cost"]    += cost
-            totals["messages"] += 1
-            sid = rec.get("sessionId")
-            if isinstance(sid, str) and sid:
-                totals["sessions"].add(sid)
-
-    by_day_out = {
-        d: {**{k: v for k, v in b.items() if k != "by_model"},
-            "by_model": dict(b["by_model"])}
-        for d, b in by_day.items()
-    }
-    heatmap_grid = [[heatmap.get((d, h), 0) for h in range(24)] for d in range(7)]
-    top_projects = sorted(
-        ({"name": k, **v} for k, v in by_project.items()),
-        key=lambda r: r["tokens"], reverse=True,
-    )[:6]
-    top_tools = sorted(
-        ({"name": k, "count": v} for k, v in tool_use.items()),
-        key=lambda r: r["count"], reverse=True,
-    )[:8]
-
-    return {
-        "by_day":     by_day_out,
-        "by_model":   {k: dict(v) for k, v in by_model.items()},
-        "projects":   top_projects,
-        "heatmap":    heatmap_grid,
-        "tools":      top_tools,
-        "burn": {"tokens_last_60min": burn_tokens, "cost_last_60min": burn_cost},
-        "totals":     _finalise_totals(totals),
-        "found":      True,
-    }
+            valid_usage = isinstance(usage, dict) and bool(usage)
+            local = None
+            time_error = None
+            if valid_usage:
+                try:
+                    ts = parse_ts(rec.get("timestamp"))
+                    local = ts.astimezone() if ts else None
+                except (ValueError, OverflowError, OSError) as error:
+                    # The reducer must decide whether this ID is already seen
+                    # before a summary raises a timestamp-conversion error.
+                    time_error = {"error": f"{type(error).__name__}:{error}"}
+            records.append({
+                "tools": [opaque(name) for name in tools],
+                "usage": [str(as_int(usage.get(key))) for key in (
+                    "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+                )] if valid_usage else None,
+                "id": opaque(msg["id"]) if isinstance(msg.get("id"), str) else None,
+                "family": family(msg.get("model")),
+                "project": opaque(project_short),
+                "session": opaque(rec["sessionId"]) if isinstance(rec.get("sessionId"), str) else None,
+                "time": {
+                    "day": local.strftime("%Y-%m-%d"),
+                    "offset": (now_local.date() - local.date()).days,
+                    "hour": local.hour, "burn": local >= burn_cut,
+                    "windows": [local >= cutoff for cutoff in cutoffs],
+                } if local else time_error,
+            })
+    prices = {name: [price[key] for key in ("in", "out", "cache_w", "cache_r")]
+              for name, price in CLAUDE_PRICES.items()}
+    result = aggregate_claude(records, prices, len(windows), summary=summary)
+    return result["summary"], result["windows"]
 
 
-def _finalise_totals(t: dict) -> dict:
-    out = dict(t)
-    out["sessions"] = len(t["sessions"]) if isinstance(t["sessions"], set) else t["sessions"]
-    return out
+def scan_claude(root: Path | None = None, *, now: datetime | None = None) -> dict:
+    """Collect Claude totals using the required Rust batch reducer."""
+    return _scan_claude_batch(root, now=now, windows=())[0]
 
 
 # ---------- Codex ----------
@@ -342,7 +277,7 @@ def merge_codex_rate_limits(candidates: list[tuple[datetime, dict]]) -> tuple[di
     return merged, latest_ts
 
 
-def scan_codex() -> dict:
+def scan_codex(root: Path | None = None) -> dict:
     """
     Codex writes one rollout JSONL per session. token_count events are
     cumulative within a session, so we sum per-event deltas. This keeps daily
@@ -362,10 +297,11 @@ def scan_codex() -> dict:
               "model": None, "pricing_model": None}
     rate_candidates: list[tuple[datetime, dict]] = []
 
-    if not CODEX_SESSIONS.exists():
+    root = CODEX_SESSIONS if root is None else Path(root)
+    if not root.exists():
         return {"by_day": {}, "totals": totals, "rate_limits": None, "found": False}
 
-    for jsonl in CODEX_SESSIONS.rglob("rollout-*.jsonl"):
+    for jsonl in root.rglob("rollout-*.jsonl"):
         previous_usage = None
         session_has_usage = False
         session_days: set[str] = set()
@@ -452,37 +388,13 @@ def fmt_money(n: float) -> str:
     return f"${n:,.2f}"
 
 
-def claude_window_tokens(hours: float) -> int:
-    """Sum Claude tokens (input+output+cache) over the last N hours from JSONLs."""
-    cut = datetime.now().astimezone() - timedelta(hours=hours)
-    total = 0
-    seen_ids: set[str] = set()
-    if not CLAUDE_PROJECTS.exists():
-        return 0
-    for jsonl in CLAUDE_PROJECTS.rglob("*.jsonl"):
-        for rec in iter_jsonl(jsonl):
-            msg = rec.get("message") or {}
-            if not isinstance(msg, dict):
-                continue
-            usage = msg.get("usage")
-            if not isinstance(usage, dict) or not usage:
-                continue
-            ts = parse_ts(rec.get("timestamp"))
-            if not ts or ts.astimezone() < cut:
-                continue
-            mid = msg.get("id")
-            if isinstance(mid, str) and mid:
-                if mid in seen_ids:
-                    continue
-                seen_ids.add(mid)
-            total += (as_int(usage.get("input_tokens"))
-                      + as_int(usage.get("output_tokens"))
-                      + as_int(usage.get("cache_creation_input_tokens"))
-                      + as_int(usage.get("cache_read_input_tokens")))
-    return total
+def claude_window_tokens(hours: float, root: Path | None = None, *, now: datetime | None = None) -> int:
+    """Sum deduplicated Claude tokens over the last N hours via the native core."""
+    return _scan_claude_batch(root, now=now, windows=(hours,), summary=False)[1][0]
 
 
-def build_view(claude: dict, codex: dict) -> dict:
+def build_view(claude: dict, codex: dict, *, claude_windows: list[int] | None = None,
+               claude_cache: Path | None = None) -> dict:
     today = datetime.now().astimezone().strftime("%Y-%m-%d")
     week_cut = (datetime.now().astimezone() - timedelta(days=6)).date()
 
@@ -518,14 +430,14 @@ def build_view(claude: dict, codex: dict) -> dict:
 
     # Sliding-window usage so the tray can show fallback counts when the
     # Claude rate-limit probe is unavailable.
-    claude_5h    = claude_window_tokens(5)
-    claude_week  = claude_window_tokens(24 * 7)
+    claude_5h, claude_week = (claude_windows if claude_windows is not None else
+                              [claude_window_tokens(5), claude_window_tokens(24 * 7)])
 
     # Plan-aware %s from probe_claude.py (cached). Best-effort.
     claude_plan = {}
     try:
         from tempfile import gettempdir
-        cache = Path(gettempdir()) / "claude_ratelimits.json"
+        cache = Path(claude_cache) if claude_cache is not None else Path(gettempdir()) / "claude_ratelimits.json"
         if cache.exists():
             d = json.loads(cache.read_text(encoding="utf-8"))
             for k in ("anthropic-ratelimit-unified-5h-utilization",
@@ -628,11 +540,20 @@ def main() -> int:
                     help="Emit compact machine-readable JSON.")
     ap.add_argument("--summary", action="store_true",
                     help="Print a short human-readable summary.")
+    ap.add_argument("--claude-projects", type=Path, help="Override the Claude JSONL root.")
+    ap.add_argument("--codex-sessions", type=Path, help="Override the Codex JSONL root.")
+    ap.add_argument("--claude-cache", type=Path, help="Override the read-only Claude rate-limit cache.")
     args = ap.parse_args()
 
-    claude = scan_claude()
-    codex  = scan_codex()
-    view   = build_view(claude, codex)
+    from usage_core import NativeCoreError
+
+    try:
+        claude, windows = _scan_claude_batch(args.claude_projects)
+        codex = scan_codex(args.codex_sessions)
+        view = build_view(claude, codex, claude_windows=windows, claude_cache=args.claude_cache)
+    except NativeCoreError as error:
+        print(str(error), file=sys.stderr)
+        return 1
 
     if args.json:
         sys.stdout.write(json.dumps(view, default=str))
