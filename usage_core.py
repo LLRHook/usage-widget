@@ -70,6 +70,21 @@ def _load_library():
         ) from error
 
 
+def _native_integer(value: str) -> int:
+    # Native BigInt sums can outgrow the decimal conversion limit even when
+    # every JSONL input was accepted. Decode this private wire in bounded
+    # chunks without changing the process-wide limit or the JSONL reader.
+    if len(value) <= 640:
+        return int(value)
+    negative = value.startswith("-")
+    digits = value[1:] if negative else value
+    result = 0
+    for offset in range(0, len(digits), 640):
+        chunk = digits[offset:offset + 640]
+        result = result * 10**len(chunk) + int(chunk)
+    return -result if negative else result
+
+
 def _request(payload: bytes) -> dict:
     lib = _load_library()
     pointer = lib.ai_usage_core_reduce(payload, len(payload))
@@ -77,7 +92,7 @@ def _request(payload: bytes) -> dict:
         raise NativeCoreError("Native collector returned no response")
     try:
         raw = ctypes.string_at(pointer)
-        response = json.loads(raw)
+        response = json.loads(raw, parse_int=_native_integer)
     except (UnicodeError, ValueError) as error:
         raise NativeCoreError("Native collector returned invalid JSON") from error
     finally:

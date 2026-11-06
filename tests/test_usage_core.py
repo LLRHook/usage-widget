@@ -150,6 +150,32 @@ class NativeParityTests(unittest.TestCase):
             widget.scan_claude(self.root)
         self.assertEqual(widget.claude_window_tokens(5, self.root), 10**400)
 
+    def test_window_sums_beyond_decimal_digit_limit_match_legacy_through_native(self):
+        for sign in (1, -1):
+            with self.subTest(sign=sign):
+                self.write([self.message("large", usage={"input_tokens": sign * (10**4300 - 1)}),
+                            self.message("carry", usage={"input_tokens": sign})])
+                self.assertEqual(widget.claude_window_tokens(5, self.root), reference.claude_window_tokens(5))
+
+    def test_large_window_response_decodes_without_changing_global_integer_limit(self):
+        summary = reference.scan_claude()
+        summary["by_day"], summary["by_model"] = [], []
+        limit = sys.get_int_max_str_digits()
+        for sign in (1, -1):
+            with self.subTest(sign=sign):
+                self.write([self.message("large", usage={"input_tokens": sign * (10**4300 - 1)}),
+                            self.message("carry", usage={"input_tokens": sign})])
+                expected = reference.claude_window_tokens(5)
+                integer = (b"-" if sign < 0 else b"") + b"1" + b"0" * 4300
+                response = b'{"version":1,"ok":{"summary":' + json.dumps(summary).encode() + b',"windows":[' + integer + b']}}'
+                buffer = ctypes.create_string_buffer(response)
+                library = MagicMock()
+                library.ai_usage_core_reduce.return_value = ctypes.addressof(buffer)
+                with patch.object(usage_core, "_load_library", return_value=library):
+                    self.assertEqual(widget.claude_window_tokens(5, self.root), expected)
+                library.ai_usage_core_free.assert_called_once_with(ctypes.addressof(buffer))
+                self.assertEqual(sys.get_int_max_str_digits(), limit)
+
     def test_nonfinite_cost_intermediates_are_not_changed_to_null(self):
         self.write([self.message(usage={"input_tokens": 10**308})])
         result, _ = self.compare()
@@ -290,7 +316,9 @@ class NativeBoundaryTests(unittest.TestCase):
         for machine, size, system, key, name in cases:
             with self.subTest(key=key), patch.object(usage_core.platform, "machine", return_value=machine), patch.object(
                 usage_core.ctypes, "sizeof", return_value=size
-            ), patch.object(usage_core.sys, "platform", system):
+            ), patch.object(usage_core.sys, "platform", system), patch.object(
+                usage_core.sysconfig, "get_platform", return_value="win-amd64" if size == 8 else "win32"
+            ):
                 self.assertEqual(usage_core.library_path(), REPO / "native" / "lib" / key / name)
 
     def test_windows_emulation_lookup_uses_python_build_architecture(self):
@@ -342,6 +370,32 @@ class NativeBoundaryTests(unittest.TestCase):
         ) as run, self.assertRaisesRegex(SystemExit, "unset CARGO_BUILD_TARGET"):
             build_native.main()
         run.assert_not_called()
+
+    def test_unicode_cargo_artifact_paths_are_staged_under_a_non_utf8_locale(self):
+        with tempfile.TemporaryDirectory(prefix="usage-core-build-") as directory:
+            root = Path(directory)
+            source = root / "José" / usage_core.library_name()
+            source.parent.mkdir()
+            source.write_bytes(b"synthetic native artifact")
+            destination = root / "native" / "lib" / usage_core.library_name()
+            output = json.dumps({"reason": "compiler-artifact", "target": {"name": "ai_usage_core"},
+                                 "filenames": [str(source)]}, ensure_ascii=False).encode("utf-8")
+            original_run = subprocess.run
+
+            def producer(_command, **options):
+                return original_run([sys.executable, "-c", "import sys; sys.stdout.buffer.write(" + repr(output) + ")"], **options)
+
+            def validate_artifact():
+                self.assertEqual(usage_core.library_path().read_bytes(), b"synthetic native artifact")
+
+            with patch.dict(os.environ), patch.object(build_native, "HERE", root), patch.object(
+                build_native, "library_path", return_value=destination
+            ), patch.object(build_native.subprocess, "run", side_effect=producer), patch.object(
+                subprocess, "_text_encoding", return_value="cp1252"
+            ), patch.object(usage_core, "_load_library", side_effect=validate_artifact):
+                os.environ.pop("CARGO_BUILD_TARGET", None)
+                self.assertEqual(build_native.main(), 0)
+            self.assertEqual(destination.read_bytes(), b"synthetic native artifact")
 
 
 if __name__ == "__main__":

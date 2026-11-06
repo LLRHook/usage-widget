@@ -22,7 +22,7 @@ def main() -> int:
     process = subprocess.run([
         "cargo", "build", "--locked", "--release", "--manifest-path", str(MANIFEST),
         "--message-format=json-render-diagnostics",
-    ], cwd=HERE, stdout=subprocess.PIPE, text=True, check=True)
+    ], cwd=HERE, stdout=subprocess.PIPE, text=True, encoding="utf-8", check=True)
     artifacts = []
     for line in process.stdout.splitlines():
         event = json.loads(line)
