@@ -268,7 +268,9 @@ fn reduce(request: &Value) -> Result<Value> {
         }
     }
     projects.entries.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens));
-    tools.entries.sort_by(|a, b| b.1.cmp(&a.1));
+    tools
+        .entries
+        .sort_by_key(|entry| std::cmp::Reverse(entry.1));
     let mut totals = totals.value(false);
     totals["sessions"] = sessions.len().into();
     Ok(json!({
