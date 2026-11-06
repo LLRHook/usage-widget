@@ -10,12 +10,13 @@ permissions:
 
 jobs:
   tests:
-    name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ['3.11', '3.13']
     steps:
       - name: Check out repository
@@ -26,9 +27,17 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
-      # GUI, HTTP, subprocess, and credential seams are mocked by the tests.
-      # Desktop requirements are unnecessary for this standard-library suite.
-      - name: Run regression tests
+      # Hosted runners provide Rust and a native linker. No desktop packages,
+      # usage records, account credentials, or startup installation are needed.
+      - name: Check native formatting
+        run: cargo fmt --manifest-path native/Cargo.toml -- --check
+      - name: Test native protocol
+        run: cargo test --locked --manifest-path native/Cargo.toml
+      - name: Lint native core
+        run: cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings
+      - name: Build and stage native collector
+        run: python build_native.py
+      - name: Run regression and host-native integration tests
         run: python -m unittest discover -v
       - name: Compile application modules
-        run: python -m py_compile widget.py widget_native.py tray.py probe_claude.py
+        run: python -m py_compile widget.py widget_native.py tray.py probe_claude.py usage_core.py build_native.py

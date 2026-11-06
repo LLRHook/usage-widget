@@ -10,3 +10,7 @@ venv/
 *.lnk
 
 docs/media/raw/
+
+# Host-specific Rust build artifacts are built locally, never committed.
+native/target/
+native/lib/
